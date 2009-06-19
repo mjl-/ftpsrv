@@ -1,0 +1,24 @@
+<../../../mkconfig
+
+TARG=\
+	ftpsrv.dis\
+
+MODULES=\
+
+SYSMODULES=\
+	arg.m\
+	bufio.m\
+	daytime.m\
+	draw.m\
+	encoding.m\
+	ip.m\
+	keyring.m\
+	lists.m\
+	security.m\
+	string.m\
+	sys.m\
+	workdir.m\
+
+DISBIN=$ROOT/dis/ip
+
+<$ROOT/mkfiles/mkdis

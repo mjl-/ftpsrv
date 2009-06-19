@@ -1,0 +1,43 @@
+.TH FTPSRV 8
+.SH NAME
+ip/ftpsrv \- ftp server
+.SH SYNOPSIS
+.B ip/ftpsrv
+[
+.B -dr
+] [
+.I root
+]
+.SH DESCRIPTION
+.B Ftpsrv
+is a simple ftp server providing anonymous access.  It is normally started by
+.IR listen (1).
+If
+.I root
+is specified on the command-line, clients can only access files below
+.IR root .
+Otherwise, clients can access files in
+.IR / .
+.PP
+Options:
+.TP
+.B -r
+Drop priviliges after startup, becoming none.
+.TP
+.B -d
+Print debugging output.
+.SH EXAMPLE
+Serve the files in /lib/ftp:
+.EX
+	listen -A 'net!*!ftp' ip/ftpsrv -r /lib/ftp
+.EE
+.SH SOURCE
+.B /appl/cmd/ip/ftpsrv.b
+.SH SEE ALSO
+.IR listen (1)
+.IR ftpfs (4)
+.br
+Internet RFCs
+.I RFC959
+and
+.I RFC3659

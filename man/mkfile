@@ -1,0 +1,6 @@
+<../mkconfig
+
+MAN=\
+	8/ftpsrv\
+
+<mkman

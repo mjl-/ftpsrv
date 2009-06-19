@@ -1,0 +1,35 @@
+# status
+
+in development.
+
+
+# intro
+
+ip/ftpsrv is a simple anonymous ftp server.
+
+
+# install
+
+first, ensure a "mkconfig" file is present.  a bind/symlink to the
+mkconfig of your inferno install should do.  now "mk install" to
+compile and install the files.
+
+
+# latest version
+
+the latest version can be found at:
+
+    http://www.ueber.net/code/r/ftpsrv
+
+
+# licence & author
+
+all files are in the public domain.  this code has been written by
+mechiel lukkien, reachable at mechiel@ueber.net or mechiel@xs4all.nl.
+
+# todo
+
+- do transfers in background, allowing aborts
+- more extensions
+- logging to /services/logs/ftp?
+- testing

@@ -1,0 +1,6 @@
+<../../mkconfig
+
+DIRS=\
+	ip\
+
+<$ROOT/mkfiles/mksubdirs
