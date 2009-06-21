@@ -38,6 +38,7 @@ Serve the files in /lib/ftp:
 .IR ftpfs (4)
 .br
 Internet RFCs
-.I RFC959
+.IR RFC959 ,
+.IR RFC2428 ,
 and
 .I RFC3659

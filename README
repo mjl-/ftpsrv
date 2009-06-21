@@ -31,5 +31,6 @@ mechiel lukkien, reachable at mechiel@ueber.net or mechiel@xs4all.nl.
 
 - do transfers in background, allowing aborts
 - more extensions
+- kill procs on timeout
 - logging to /services/logs/ftp?
 - testing

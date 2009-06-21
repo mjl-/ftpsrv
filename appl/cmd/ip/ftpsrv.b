@@ -38,6 +38,8 @@ out: ref Sys->FD;	# control output
 datatype := "ascii";	# type, "ascii" or "image"
 retroff := big 0;	# offset of next "get"
 renamefrom: string;	# source file for next rename
+user: string;		# user we are running as
+epsvonly := 0;		# only epsv accepted for data channel
 
 datadialaddr: string;	# client address, to dial for data commands
 dataannounce: ref Sys->Connection;	# local connection, client dials this for data commands
@@ -53,7 +55,7 @@ localip: IPaddr;
 remoteip: IPaddr;
 
 datacmds := array[] of {
-"stor", "stou", "retr", "list", "nlst", "appe",
+"stor", "stou", "retr", "list", "nlst", "appe", "mlsd",
 };
 busycmds := array[] of {
 "rein", "quit", "abor",
@@ -109,6 +111,13 @@ init(nil: ref Draw->Context, argv: list of string)
 		if(fd == nil || sys->fprint(fd, "none") < 0)
 			fail(sprint("failed to change to user none: %r"));
 	}
+	ufd := sys->open("/dev/user", Sys->OREAD);
+	if(ufd != nil) {
+		n := sys->read(ufd, buf := array[128] of byte, len buf);
+		if(n >= 0)
+			user = string buf[:n];
+	}
+	ufd = nil;
 
 	sys->pctl(Sys->FORKNS|Sys->NODEVS, nil);
 	if(root != nil && sys->bind(root, "/", Sys->MREPL) < 0)
@@ -222,6 +231,14 @@ docmd()
 		say("connected to remote");
 	}
 
+	if(epsvonly)
+		case cmd {
+		"port" or
+		"eprt" or
+		"pasv" =>
+			return write("550 only epsv allowed now");
+		}
+
 	case cmd {
 	# login
 	"user" or
@@ -243,6 +260,8 @@ docmd()
 	"rein" =>
 		# xxx wait for data transfer to finish
 		datatype = "ascii";
+		retroff = nil;
+		renamefrom = nil;
 		write("200 ok");
 	"quit" =>
 		# xxx wait for data transfer to finish
@@ -252,20 +271,43 @@ docmd()
 		return;
 
 	# transfer params
-	"port" =>
+	"port" or
+	"eprt" =>
 		netclear();
 
-		(ips, port, err) := parsehostport(args);
+		(ips, port, err) := parsehostport(args, cmd);
 		if(err != nil) {
-			write("500 bad host-port: "+err);
+			write(err);
 		} else if(ips != remoteip.text()) {
 			write(sprint("501 not your ip, %s != %s", ips, remoteip.text()));
 		} else {
 			datadialaddr = sprint("tcp!%s!%d", ips, port);
 			write("200 ok");
 		}
-	"pasv" =>
+	"pasv" or
+	"epsv" =>
 		netclear();
+
+		if(cmd == "pasv" && !localip.isv4())
+			return write("550 non-ipv4 not supported in PASV");
+
+		if(cmd == "epsv" && args != nil) {
+			if(str->tolower(args) == "all") {
+				epsvonly = 1;
+				# xxx should this be all we do?
+				return write("200 ok");
+			} else {
+				(v, rem) := str->toint(args, 10);
+				if(rem != nil)
+					return write(sprint("500 bad epsv parameter %#q", args));
+				if(v == 1 && !remoteip.isv4())
+					return write("550 mismatch requested and used address family");
+				if(v == 2 && remoteip.isv4())
+					return write("550 mismatch requested and used addres family");
+				if(v != 1 && v != 2)
+					return write("550 unsupported address family");
+			}
+		}
 
 		lport: int;
 		err: string;
@@ -274,48 +316,53 @@ docmd()
 		if(err != nil) {
 			write("501 announce failed: "+err);
 		} else {
-			v := localip.v4();
-			write(sprint("227 Entering Passive Mode (%d,%d,%d,%d,%d,%d).",
-				int v[0], int v[1], int v[2], int v[3], (lport>>8)&255, (lport>>0)&255));
+			case cmd {
+			"pasv" =>
+				v := localip.v4();
+				write(sprint("227 Entering Passive Mode (%d,%d,%d,%d,%d,%d).",
+					int v[0], int v[1], int v[2], int v[3], (lport>>8)&255, (lport>>0)&255));
+			"espv" =>
+				write(sprint("229 Entering Extended Passive Mode (|||%d|)", lport));
+			}
 		}
 	"mode" =>
-		case args {
-		"S" =>	write("200 ok");
-		"B" =>	write("501 block mode not supported");
-		"C" =>	write("501 compressed mode not supported");
+		case str->tolower(args) {
+		"s" =>	write("200 ok");
+		"b" =>	write("501 block mode not supported");
+		"c" =>	write("501 compressed mode not supported");
 		* =>	write(sprint("501 unrecognized mode %#q", args));
 		}
 	"type" =>
-		case args {
-		"A" or
-		"AN" =>
+		case str->tolower(args) {
+		"a" or
+		"a n" =>
 			datatype = "ascii";
 			write("200 ok");
-		"I" =>
+		"i" =>
 			datatype = "image";
 			write("200 ok");
-		"E" or
-		"EN" or
-		"ET" or
-		"EC" =>
+		"e" or
+		"e n" or
+		"e t" or
+		"e c" =>
 			write("501 type ebcdic not supported");
-		"AT" or
-		"AC" =>
+		"a t" or
+		"a c" =>
 			write("501 type ascii with 'telnet effectors'/'carriage control (asa)' not supported");
 		* =>
 			write(sprint("501 unrecognized mode %#q", args));
 		}
 	"stru" =>
-		case args {
-		"F" =>	write("200 ok");
-		"R" =>	write("501 record structure not supported");
-		"P" =>	write("501 page structure not supported");
+		case str->tolower(args) {
+		"f" =>	write("200 ok");
+		"r" =>	write("501 record structure not supported");
+		"p" =>	write("501 page structure not supported");
 		* =>	write(sprint("501 unrecognized structure %#q", args));
 		}
 
 	# file actions
 	"allo" =>
-		write("200 try me");
+		write("202 try me");
 	"rest" =>
 		rem: string;
 		(retroff, rem) = str->tobig(args, 10);
@@ -323,7 +370,7 @@ docmd()
 			retroff = big 0;
 			return write(sprint("501 bad offset %#q", args));
 		} else
-			write("200 ok");
+			write("350 ok");
 	"stor" =>
 		ftpstor(args);
 	"stou" =>
@@ -399,13 +446,64 @@ docmd()
 				writemulti("211", lines);
 		}
 	"help" =>
-		write("211 see rfc959");
+		write("211 see rfc959,rfc2428,rfc3659");
 
 	# misc
 	"site" =>
 		write("502 SITE not implemented");
 	"noop" =>
 		write("200 ok");
+
+	# extensions
+	"mdtm" or
+	"size" =>
+		if(args == nil)
+			return write("501 need a path");
+		(ok, dir) := sys->stat(args);
+		if(ok < 0)
+			return write(sprint("550 stat %q: %r", args));
+		case cmd {
+		"mdtm" =>
+			write(sprint("213 %s", mdtmstr(dir.mtime)));
+		"size" =>
+			length := dir.length;
+			err: string;
+			if(datatype == "ascii")
+				(length, err) = asciisize(args);
+			if(err != nil)
+				return write("550 "+err);
+			write(sprint("213 %bd", length));
+		}
+	"mlst" =>
+		if(args == nil)
+			args = cwd();
+		(ok, dir) := sys->stat(args);
+		if(ok < 0)
+			return write(sprint("550 stat %q: %r", args));
+		writemulti("250", list of {
+			"begin",
+			mlst(cwd(), args, dir),
+			"end",
+		});
+	"mlsd" =>
+		if(args == nil)
+			args = cwd();
+		ftpmlsd(args);
+	"feat" =>
+		writemulti("211", list of {
+			"features",
+			"MDTM",
+			"SIZE",
+			"REST STREAM",
+			"MLST type*;size*;modify*;perm*;",
+			"UTF8",
+			"end",
+		});
+	"opts" =>
+		case args {
+		* =>
+			write(sprint("550 no options for %#q", args));
+		}
 
 	# all else unsupported
 	* =>
@@ -588,30 +686,158 @@ ftpnlst(args: string)
 			return write(sprint("451 dirread: %r"));
 		if(n == 0)
 			break;
-		for(i := 0; i < n; i++)
-			b.puts(sprint("%s\r\n", d[i].name));
+		for(i := 0; i < n; i++) {
+			b.puts(d[i].name);
+			b.puts("\r\n");
+		}
 	}
-	b.flush();
+	if(b.flush() == Bufio->ERROR)
+		write(sprint("451 write: %r"));
+	write("226 done");
 	datafd = nil;
 }
 
-parsehostport(s: string): (string, int, string)
+ftpmlsd(args: string)
+{
+	fd := sys->open(args, Sys->OREAD);
+	if(fd == nil)
+		return write(sprint("550 open %q: %r", args));
+
+	c := cwd();
+	b := bufio->fopen(datafd, Bufio->OWRITE);
+	for(;;) {
+		(n, d) := sys->dirread(fd);
+		if(n < 0)
+			return write(sprint("451 dirread: %r"));
+		if(n == 0)
+			break;
+		for(i := 0; i < n; i++) {
+			b.puts(mlst(c, args+"/"+d[i].name, d[i]));
+			b.puts("\r\n");
+		}
+	}
+	if(b.flush() == Bufio->ERROR)
+		write(sprint("451 write: %r"));
+	datafd = nil;
+	write("226 done");
+}
+
+mdtmstr(t: int): string
+{
+	tm := daytime->local(t);
+	return sprint("%04d%02d%02d%02d%02d%02d", tm.year+1900, tm.mon+1, tm.mday, tm.hour, tm.min, tm.sec);
+}
+
+asciisize(p: string): (big, string)
+{
+	fd := sys->open(p, Sys->OREAD);
+	if(fd == nil)
+		return (big -1, sprint("open %q: %r", p));
+	buf := array[Sys->ATOMICIO] of byte;
+	size := big 0;
+	for(;;) {
+		n := sys->read(fd, buf, len buf);
+		if(n < 0)
+			return (big -1, sprint("read %q: %r", p));
+		if(n == 0)
+			break;
+		for(i := 0; i < n; i++) {
+			size++;
+			if(buf[i] == byte '\n')
+				size++;
+		}
+	}
+	return (size, nil);
+}
+
+mlst(cwd, path: string, dir: Sys->Dir): string
+{
+	t := "file";
+	if(dir.mode & Sys->DMDIR) {
+		t = "dir";
+		if(cwd == path)
+			t = "cdir";
+	}
+	return sprint("type=%s;modify=%s;size=%bd;perm=%s; %s", t, mdtmstr(dir.mtime), dir.length, lstpermstr(dir), dir.name);
+}
+
+lstpermstr(dir: Sys->Dir): string
+{
+	mode := dir.mode&7;
+	if(dir.uid == user)
+		mode = dir.mode>>6;
+	r := mode & 4;
+	w := mode & 2;
+	x := mode & 1;
+	isdir := dir.mode & Sys->DMDIR;
+	s := "";
+	if(isdir) {
+		if(w && x) s += "cmp";
+		if(x) s += "e";
+		if(r && x) s += "l";
+	} else {
+		if(w) s += "aw";
+		if(r) s += "r";
+	}
+	return s;
+}
+
+parsehostport(s: string, cmd: string): (string, int, string)
+{
+	if(cmd == "pasv")
+		return parsehostport0(s);
+	return parsehostport1(s);
+}
+
+parsehostport0(s: string): (string, int, string)
 {
 	t := sys->tokenize(s, ",").t1;
 	if(len t != 6)
-		return (nil, 0, "not 4+2 values");
+		return (nil, 0, "500 not 4+2 values");
 	v := array[6] of int;
 	i := 0;
 	for(; t != nil; t = tl t) {
 		rem: string;
 		(v[i], rem) = str->toint(hd t, 10);
 		if(rem != nil || v[i] < 0 || v[i] > 255)
-			return (nil, 0, sprint("bad value %#q, not number or too low/high", hd t));
+			return (nil, 0, sprint("500 bad value %#q, not number or too low/high", hd t));
 		i++;
 	}
 	ips := sprint("%d.%d.%d.%d", v[0], v[1], v[2], v[3]);
 	port := (v[4]<<8)|(v[5]<<0);
 	return (ips, port, nil);
+}
+
+parsehostport1(s: string): (string, int, string)
+{
+	if(s == nil)
+		return (nil, 0, "500 empty parameter");
+	sep := s[0:1];
+	af, addr, port: string;
+	(af, s) = str->splitstrl(s[1:], sep);
+	if(s == nil)
+		return (nil, 0, "500 malformed parameter, after address family");
+	(addr, s) = str->splitstrl(s[1:], sep);
+	if(s == nil)
+		return (nil, 0, "500 malformed parameter, after address");
+	(port, s) = str->splitstrl(s[1:], sep);
+	if(s == nil)
+		return (nil, 0, "500 malformed parameter, after port");
+	if(s != sep)
+		return (nil, 0, "500 leftover text after parameter");
+	(afn, rem) := str->toint(af, 10);
+	if(rem != nil)
+		return (nil, 0, sprint("500 bad address family %#q", af));
+	if(afn != 1 && afn != 2)
+		return (nil, 0, sprint("522 unsupported address family %d.  try (1,2)", afn));
+	(ok, ipa) := IPaddr.parse(addr);
+	if(ok < 0)
+		return (nil, 0, sprint("500 bad ip address %#q", addr));
+	portn: int;
+	(portn, rem) = str->toint(port, 10);
+	if(rem != nil)
+		return (nil, 0, sprint("500 bad port %#q", port));
+	return (ipa.text(), portn, nil);
 }
 
 stat(path: string): (list of string, string)
@@ -680,8 +906,8 @@ readip(f: string): (IPaddr, string)
 	addr := string buf[:n];
 	ips := str->splitstrl(addr, "!").t0;
 	(ok, ipa) := IPaddr.parse(ips);
-	if(ok < 0 || !ipa.isv4())
-		return (b, "bad v4 address");
+	if(ok < 0)
+		return (b, "bad address");
 	return (ipa, nil);
 }
 
