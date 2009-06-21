@@ -29,6 +29,8 @@ Ftpsrv: module {
 	init:	fn(nil: ref Draw->Context, args: list of string);
 };
 
+Asciisizemax:	con big (256*1024);
+
 dflag: int;
 rflag: int;
 
@@ -45,6 +47,9 @@ datadialaddr: string;	# client address, to dial for data commands
 dataannounce: ref Sys->Connection;	# local connection, client dials this for data commands
 datafd: ref Sys->FD;	# connection to client
 datapid := -1;		# prog doing i/o on datafd
+
+cmdc: chan of (string, string, string);
+donec: chan of string;
 
 dialc: chan of (string, chan of (ref Sys->FD, string));
 announcec: chan of (string, chan of (ref Sys->Connection, int, string));
@@ -127,15 +132,34 @@ init(nil: ref Draw->Context, argv: list of string)
 
 	in = bufio->fopen(sys->fildes(0), Bufio->OREAD);
 	out = sys->fildes(1);
+
+	cmdc = chan of (string, string, string);
+	donec = chan of string;
+	spawn cmdreader();
+
 	write("220 ip/ftpsrv ready, welcome");
-	while(!stop)
-		docmd();
+
+	while(!stop) alt {
+	(cmd, args, rerr) := <-cmdc =>
+		if(rerr != nil) {
+			say("read cmd: "+rerr);
+			stop = 1;
+			break;
+		}
+		docmd(cmd, args);
+
+	s := <-donec =>
+		datafd = nil;
+		datapid = -1;
+		write(s);
+	}
 	kill(netpid);
 }
 
 net(pidc: chan of int)
 {
-	pidc <-= sys->pctl(0, nil);
+	pidc <-= pid();
+
 	for(;;) alt {
 	(addr, rc) := <-dialc =>
 		say("net: dialing "+addr);
@@ -195,9 +219,29 @@ netdial(addr: string): (ref Sys->FD, string)
 
 netclear()
 {
-	datafd = nil;
 	datadialaddr = nil;
 	dataannounce = nil;
+}
+
+cmdreader()
+{
+	for(;;) {
+		l := in.gets('\n');
+		if(l == nil) {
+			cmdc <-= (nil, nil, "eof");
+			return;
+		}
+		if(len l == 1 || l[len l-2] != '\r') {
+			cmdc <-= (nil, nil, "missing carriage return before newline");  # or should we read up to read newline?
+			return;
+		}
+		l = l[:len l-2];
+		say("> "+l);
+		(cmd, args) := str->splitstrl(l, " ");
+		if(args != nil)
+			args = args[1:];
+		cmdc <-= (cmd, args, nil);
+	}
 }
 
 iscmd(a: array of string, cmd: string): int
@@ -208,26 +252,62 @@ iscmd(a: array of string, cmd: string): int
 	return 0;
 }
 
-docmd()
+waitdone()
 {
-	(cmd, args) := read();
+	s := <-donec;
+	datapid = -1;
+	datafd = nil;
+	write(s);
+}
+
+connect(rc: chan of (ref Sys->FD, string), pidc: chan of int)
+{
+	pidc <-= pid();
+
+	fd: ref Sys->FD;
+	err: string;
+	if(datadialaddr != nil)
+		(fd, err) = netdial(datadialaddr);
+	else if(dataannounce != nil)
+		(fd, err) = netlisten(*dataannounce);
+	else
+		err = "no connection parameters set";
+	rc <-= (fd, err);
+}
+
+docmd(cmd, args: string)
+{
 	cmd = str->tolower(cmd);
 
-	if(datapid >= 0 && !iscmd(busycmds, cmd))
-		return write("501 busy");
+	if(datapid >= 0 && !iscmd(busycmds, cmd)) {
+		waitdone();
+		netclear();
+	}
 
 	if(iscmd(datacmds, cmd)) {
-		# xxx should do this in background, possibly timeout, but at least accept abort commands
 		write("150 connecting...");
-		err: string;
-		if(datadialaddr != nil)
-			(datafd, err) = netdial(datadialaddr);
-		else if(dataannounce != nil)
-			(datafd, err) = netlisten(*dataannounce);
-		else
-			err = "no connection parameters set";
-		if(err != nil)
-			return write("425 no connection: "+err);
+
+		rc := chan of (ref Sys->FD, string);
+		spawn connect(rc, pidc := chan of int);
+		cpid := <-pidc;
+
+		derr: string;
+		alt {
+		(datafd, derr) = <-rc =>
+			if(derr != nil)
+				return write("425 "+derr);
+		(ncmd, nil, err) := <-cmdc =>
+			if(err != nil) {
+				say("read cmd error during connect: "+err);
+				stop = 1;
+				return;
+			}
+			if(str->tolower(ncmd) == "abor") {
+				kill(cpid);
+				return write("420 interrupted during connect");
+			}
+			return write(sprint("420 interrupted with non-abort command %#q during connect, new command dropped", ncmd));
+		}
 		say("connected to remote");
 	}
 
@@ -236,7 +316,7 @@ docmd()
 		"port" or
 		"eprt" or
 		"pasv" =>
-			return write("550 only epsv allowed now");
+			return write("520 only epsv allowed now");
 		}
 
 	case cmd {
@@ -247,28 +327,28 @@ docmd()
 		write("230 anonymous login ok, no password/account info needed");
 	"cwd" =>
 		if(sys->chdir(args) < 0)
-			write(sprint("501 CWD failed: %r"));
+			write(sprint("550 CWD failed: %r"));
 		else
-			write("200 ok");
+			write(sprint("200 %q", cwd()));
 	"cdup" =>
 		if(sys->chdir("..") < 0)
-			write(sprint("501 CDUP failed: %r"));
+			write(sprint("550 CDUP failed: %r"));
 		else
-			write("200 ok");
+			write(sprint("200 %q", cwd()));
 
 	# logout
 	"rein" =>
-		# xxx wait for data transfer to finish
-		datatype = "ascii";
-		retroff = nil;
+		retroff = big 0;
 		renamefrom = nil;
+		if(datapid >= 0)
+			waitdone();
 		write("200 ok");
+		datatype = "ascii";
 	"quit" =>
-		# xxx wait for data transfer to finish
-		write("221 quiting");
-		kill(netpid);
 		stop = 1;
-		return;
+		if(datapid >= 0)
+			waitdone();
+		write("221 bye");
 
 	# transfer params
 	"port" or
@@ -279,7 +359,7 @@ docmd()
 		if(err != nil) {
 			write(err);
 		} else if(ips != remoteip.text()) {
-			write(sprint("501 not your ip, %s != %s", ips, remoteip.text()));
+			write(sprint("521 not your ip, %s != %s", ips, remoteip.text()));
 		} else {
 			datadialaddr = sprint("tcp!%s!%d", ips, port);
 			write("200 ok");
@@ -289,7 +369,7 @@ docmd()
 		netclear();
 
 		if(cmd == "pasv" && !localip.isv4())
-			return write("550 non-ipv4 not supported in PASV");
+			return write("520 non-ipv4 not supported in PASV");
 
 		if(cmd == "epsv" && args != nil) {
 			if(str->tolower(args) == "all") {
@@ -301,11 +381,11 @@ docmd()
 				if(rem != nil)
 					return write(sprint("500 bad epsv parameter %#q", args));
 				if(v == 1 && !remoteip.isv4())
-					return write("550 mismatch requested and used address family");
+					return write("520 mismatch requested and used address family");
 				if(v == 2 && remoteip.isv4())
-					return write("550 mismatch requested and used addres family");
+					return write("520 mismatch requested and used addres family");
 				if(v != 1 && v != 2)
-					return write("550 unsupported address family");
+					return write("520 unsupported address family");
 			}
 		}
 
@@ -314,23 +394,23 @@ docmd()
 		addr := sprint("net!%s!0", localip.text());
 		(dataannounce, lport, err) = netannounce(addr);
 		if(err != nil) {
-			write("501 announce failed: "+err);
+			write("521 announce failed: "+err);
 		} else {
 			case cmd {
 			"pasv" =>
 				v := localip.v4();
 				write(sprint("227 Entering Passive Mode (%d,%d,%d,%d,%d,%d).",
 					int v[0], int v[1], int v[2], int v[3], (lport>>8)&255, (lport>>0)&255));
-			"espv" =>
+			"epsv" =>
 				write(sprint("229 Entering Extended Passive Mode (|||%d|)", lport));
 			}
 		}
 	"mode" =>
 		case str->tolower(args) {
 		"s" =>	write("200 ok");
-		"b" =>	write("501 block mode not supported");
-		"c" =>	write("501 compressed mode not supported");
-		* =>	write(sprint("501 unrecognized mode %#q", args));
+		"b" =>	write("504 block mode not supported");
+		"c" =>	write("504 compressed mode not supported");
+		* =>	write(sprint("504 unrecognized mode %#q", args));
 		}
 	"type" =>
 		case str->tolower(args) {
@@ -345,19 +425,19 @@ docmd()
 		"e n" or
 		"e t" or
 		"e c" =>
-			write("501 type ebcdic not supported");
+			write("504 type ebcdic not supported");
 		"a t" or
 		"a c" =>
-			write("501 type ascii with 'telnet effectors'/'carriage control (asa)' not supported");
+			write("504 type ascii with 'telnet effectors'/'carriage control (asa)' not supported");
 		* =>
-			write(sprint("501 unrecognized mode %#q", args));
+			write(sprint("504 unrecognized mode %#q", args));
 		}
 	"stru" =>
 		case str->tolower(args) {
 		"f" =>	write("200 ok");
-		"r" =>	write("501 record structure not supported");
-		"p" =>	write("501 page structure not supported");
-		* =>	write(sprint("501 unrecognized structure %#q", args));
+		"r" =>	write("504 record structure not supported");
+		"p" =>	write("504 page structure not supported");
+		* =>	write(sprint("504 unrecognized structure %#q", args));
 		}
 
 	# file actions
@@ -372,17 +452,23 @@ docmd()
 		} else
 			write("350 ok");
 	"stor" =>
-		ftpstor(args);
+		spawn ftpstor(args, pidc := chan of int);
+		datapid = <-pidc;
 	"stou" =>
-		ftpstou(args);
+		spawn ftpstou(args, pidc := chan of int);
+		datapid = <-pidc;
 	"retr" =>
-		ftpretr(args, datatype == "ascii");
+		spawn ftpretr(args, datatype == "ascii", pidc := chan of int);
+		datapid = <-pidc;
 	"list" =>
-		ftplist(args);
+		spawn ftplist(args, pidc := chan of int);
+		datapid = <-pidc;
 	"nlst" =>
-		ftpnlst(args);
+		spawn ftpnlst(args, pidc := chan of int);
+		datapid = <-pidc;
 	"appe" =>
-		ftpappe(args);
+		spawn ftpappe(args, pidc := chan of int);
+		datapid = <-pidc;
 	"rnfr" =>
 		renamefrom = args;
 		if(args == nil)
@@ -405,19 +491,19 @@ docmd()
 			dir := sys->nulldir;
 			dir.name = name[1:];
 			if(sys->wstat(renamefrom, dir) < 0)
-				return write(sprint("501 rename: %r"));
+				return write(sprint("550 rename: %r"));
 			write("200 ok");
 			renamefrom = nil;
 		}
 	"dele" or
 	"rmd" =>
 		if(sys->remove(args) < 0)
-			write(sprint("501 remove failed: %r"));
+			write(sprint("550 remove failed: %r"));
 		else
 			write("250 ok");
 	"mkd" =>
 		if(sys->create(args, Sys->OREAD, 8r777|Sys->DMDIR) != nil)
-			write(sprint("501 mkdir failed: %r"));
+			write(sprint("550 mkdir failed: %r"));
 		else
 			write("257 ok");
 	"pwd" =>
@@ -469,7 +555,7 @@ docmd()
 			length := dir.length;
 			err: string;
 			if(datatype == "ascii")
-				(length, err) = asciisize(args);
+				(length, err) = asciisize(args, length);
 			if(err != nil)
 				return write("550 "+err);
 			write(sprint("213 %bd", length));
@@ -488,7 +574,8 @@ docmd()
 	"mlsd" =>
 		if(args == nil)
 			args = cwd();
-		ftpmlsd(args);
+		spawn ftpmlsd(args, pidc := chan of int);
+		datapid = <-pidc;
 	"feat" =>
 		writemulti("211", list of {
 			"features",
@@ -502,7 +589,7 @@ docmd()
 	"opts" =>
 		case args {
 		* =>
-			write(sprint("550 no options for %#q", args));
+			write(sprint("504 no options for %#q", args));
 		}
 
 	# all else unsupported
@@ -511,73 +598,83 @@ docmd()
 	}
 }
 
-ftpstor(args: string)
+done(s: string)
 {
+	donec <-= s;
+}
+
+ftpstor(args: string, pidc: chan of int)
+{
+	pidc <-= pid();
+
 	fd := sys->create(args, Sys->OWRITE|Sys->OTRUNC, 8r666);
 	if(fd == nil)
-		return write(sprint("501 create %q: %r", args));
+		return done(sprint("451 create %q: %r", args));
 	buf := array[Sys->ATOMICIO] of byte;
 	for(;;) {
 		n := sys->read(datafd, buf, len buf);
 		if(n < 0)
-			return write(sprint("501 read: %r"));
+			return done(sprint("451 read: %r"));
 		if(n == 0)
 			break;
 		if(sys->write(fd, buf, n) != n)
-			return write(sprint("501 write: %r"));
+			return done(sprint("451 write: %r"));
 	}
-	datafd = nil;
-	write("226 done");
+	return done("226 done");
 }
 
-ftpstou(args: string)
+ftpstou(args: string, pidc: chan of int)
 {
+	pidc <-= pid();
+
 	fbuf := random->randombuf(Random->NotQuiteRandom, 10);
 	f := base16->enc(fbuf);
 	fd := sys->create(args, Sys->OWRITE|Sys->OEXCL, 8r666);
 	if(fd == nil)
-		return write(sprint("451 create %q: %r", f));
+		return done(sprint("451 create %q: %r", f));
 	buf := array[Sys->ATOMICIO] of byte;
 	for(;;) {
 		n := sys->read(datafd, buf, len buf);
 		if(n < 0)
-			return write(sprint("451 read: %r"));
+			return done(sprint("451 read: %r"));
 		if(n == 0)
 			break;
 		if(sys->write(fd, buf, n) != n)
-			return write(sprint("451 write: %r"));
+			return done(sprint("451 write: %r"));
 	}
-	datafd = nil;
-	write(sprint("226 %q created", f));
+	return done(sprint("226 %q created", f));
 }
 
-ftpappe(args: string)
+ftpappe(args: string, pidc: chan of int)
 {
+	pidc <-= pid();
+
 	fd := sys->create(args, Sys->OWRITE|Sys->OEXCL, 8r666);
 	if(fd == nil)
 		fd = sys->open(args, Sys->OWRITE);
 	if(fd == nil)
-		return write(sprint("451 open %q: %r", args));
+		return done(sprint("451 open %q: %r", args));
 	sys->seek(fd, big 0, Sys->SEEKEND);
 	buf := array[Sys->ATOMICIO] of byte;
 	for(;;) {
 		n := sys->read(datafd, buf, len buf);
 		if(n < 0)
-			return write(sprint("451 read: %r"));
+			return done(sprint("451 read: %r"));
 		if(n == 0)
 			break;
 		if(sys->write(fd, buf, n) != n)
-			return write(sprint("451 write: %r"));
+			return done(sprint("451 write: %r"));
 	}
-	datafd = nil;
-	write("226 done");
+	return done("226 done");
 }
 
-ftpretr(args: string, ascii: int)
+ftpretr(args: string, ascii: int, pidc: chan of int)
 {
+	pidc <-= pid();
+
 	fd := sys->open(args, Sys->OREAD);
 	if(fd == nil)
-		return write(sprint("451 open %q: %r", args));
+		return done(sprint("451 open %q: %r", args));
 	sys->seek(fd, retroff, Sys->SEEKSTART);
 	retroff = big 0;
 	buf := array[Sys->ATOMICIO] of byte;
@@ -586,7 +683,7 @@ ftpretr(args: string, ascii: int)
 	for(;;) {
 		n := sys->read(fd, buf, len buf);
 		if(n < 0)
-			return write(sprint("451 read: %r"));
+			return done(sprint("451 read: %r"));
 		if(n == 0)
 			break;
 		if(ascii) {
@@ -604,50 +701,49 @@ ftpretr(args: string, ascii: int)
 				b.write(buf[o:], n-o);
 		} else {
 			if(sys->write(datafd, buf, n) != n)
-				return write(sprint("451 write: %r"));
+				return done(sprint("451 write: %r"));
 		}
 	}
 	if(ascii && b.flush() == Bufio->ERROR)
-		return write(sprint("451 write: %r"));
-	datafd = nil;
-	write("226 done");
+		return done(sprint("451 write: %r"));
+	return done("226 done");
 }
 
-ftplist(args: string)
+ftplist(args: string, pidc: chan of int)
 {
+	pidc <-= pid();
+
 	if(args == nil)
 		args = cwd();
 	if(args == nil)
-		return write("451 cannot find cwd");
+		return done("451 cannot find cwd");
 	(ok, dir) := sys->stat(args);
 	if(ok < 0)
-		return write(sprint("451 stat %q: %r", args));
+		return done(sprint("451 stat %q: %r", args));
 
 	now := daytime->now();
 	isdir := dir.mode & Sys->DMDIR;
 	if(!isdir) {
 		if(sys->fprint(datafd, "%s\r\n", liststr(now, dir)) < 0)
-			return write(sprint("451 write: %r"));
-		datafd = nil;
-		return write("226 done");
+			return done(sprint("451 write: %r"));
+		return done("226 done");
 	}
 
 	fd := sys->open(args, Sys->OREAD);
 	if(fd == nil)
-		return write(sprint("451 open %q: %r", args));
+		return done(sprint("451 open %q: %r", args));
 	b := bufio->fopen(datafd, Bufio->OWRITE);
 	for(;;) {
 		(n, d) := sys->dirread(fd);
 		if(n < 0)
-			return write(sprint("451 dirread: %r"));
+			return done(sprint("451 dirread: %r"));
 		if(n == 0)
 			break;
 		for(i := 0; i < n; i++)
 			b.puts(liststr(now, d[i])+"\r\n");
 	}
 	b.flush();
-	datafd = nil;
-	write("226 done");
+	return done("226 done");
 }
 
 liststr(now: int, d: Sys->Dir): string
@@ -672,18 +768,20 @@ permstr(d: Sys->Dir): string
 	return s;
 }
 
-ftpnlst(args: string)
+ftpnlst(args: string, pidc: chan of int)
 {
+	pidc <-= pid();
+
 	if(args == nil)
 		args = cwd();
 	fd := sys->open(args, Sys->OREAD);
 	if(fd == nil)
-		return write(sprint("451 open %q: %r", args));
+		return done(sprint("451 open %q: %r", args));
 	b := bufio->fopen(datafd, Bufio->OWRITE);
 	for(;;) {
 		(n, d) := sys->dirread(fd);
 		if(n < 0)
-			return write(sprint("451 dirread: %r"));
+			return done(sprint("451 dirread: %r"));
 		if(n == 0)
 			break;
 		for(i := 0; i < n; i++) {
@@ -692,23 +790,24 @@ ftpnlst(args: string)
 		}
 	}
 	if(b.flush() == Bufio->ERROR)
-		write(sprint("451 write: %r"));
-	write("226 done");
-	datafd = nil;
+		return done(sprint("451 write: %r"));
+	return done("226 done");
 }
 
-ftpmlsd(args: string)
+ftpmlsd(args: string, pidc: chan of int)
 {
+	pidc <-= pid();
+
 	fd := sys->open(args, Sys->OREAD);
 	if(fd == nil)
-		return write(sprint("550 open %q: %r", args));
+		return done(sprint("451 open %q: %r", args));
 
 	c := cwd();
 	b := bufio->fopen(datafd, Bufio->OWRITE);
 	for(;;) {
 		(n, d) := sys->dirread(fd);
 		if(n < 0)
-			return write(sprint("451 dirread: %r"));
+			return done(sprint("451 dirread: %r"));
 		if(n == 0)
 			break;
 		for(i := 0; i < n; i++) {
@@ -717,9 +816,8 @@ ftpmlsd(args: string)
 		}
 	}
 	if(b.flush() == Bufio->ERROR)
-		write(sprint("451 write: %r"));
-	datafd = nil;
-	write("226 done");
+		return done(sprint("451 write: %r"));
+	return done("226 done");
 }
 
 mdtmstr(t: int): string
@@ -728,8 +826,10 @@ mdtmstr(t: int): string
 	return sprint("%04d%02d%02d%02d%02d%02d", tm.year+1900, tm.mon+1, tm.mday, tm.hour, tm.min, tm.sec);
 }
 
-asciisize(p: string): (big, string)
+asciisize(p: string, length: big): (big, string)
 {
+	if(length > Asciisizemax)
+		return (big -1, sprint("refusing to read through %bd (>%bd) bytes to count newlines", length, Asciisizemax));
 	fd := sys->open(p, Sys->OREAD);
 	if(fd == nil)
 		return (big -1, sprint("open %q: %r", p));
@@ -793,14 +893,14 @@ parsehostport0(s: string): (string, int, string)
 {
 	t := sys->tokenize(s, ",").t1;
 	if(len t != 6)
-		return (nil, 0, "500 not 4+2 values");
+		return (nil, 0, "501 not 4+2 values");
 	v := array[6] of int;
 	i := 0;
 	for(; t != nil; t = tl t) {
 		rem: string;
 		(v[i], rem) = str->toint(hd t, 10);
 		if(rem != nil || v[i] < 0 || v[i] > 255)
-			return (nil, 0, sprint("500 bad value %#q, not number or too low/high", hd t));
+			return (nil, 0, sprint("501 bad value %#q, not number or too low/high", hd t));
 		i++;
 	}
 	ips := sprint("%d.%d.%d.%d", v[0], v[1], v[2], v[3]);
@@ -811,32 +911,32 @@ parsehostport0(s: string): (string, int, string)
 parsehostport1(s: string): (string, int, string)
 {
 	if(s == nil)
-		return (nil, 0, "500 empty parameter");
+		return (nil, 0, "501 empty parameter");
 	sep := s[0:1];
 	af, addr, port: string;
 	(af, s) = str->splitstrl(s[1:], sep);
 	if(s == nil)
-		return (nil, 0, "500 malformed parameter, after address family");
+		return (nil, 0, "501 malformed parameter, after address family");
 	(addr, s) = str->splitstrl(s[1:], sep);
 	if(s == nil)
-		return (nil, 0, "500 malformed parameter, after address");
+		return (nil, 0, "501 malformed parameter, after address");
 	(port, s) = str->splitstrl(s[1:], sep);
 	if(s == nil)
-		return (nil, 0, "500 malformed parameter, after port");
+		return (nil, 0, "501 malformed parameter, after port");
 	if(s != sep)
-		return (nil, 0, "500 leftover text after parameter");
+		return (nil, 0, "501 leftover text after parameter");
 	(afn, rem) := str->toint(af, 10);
 	if(rem != nil)
-		return (nil, 0, sprint("500 bad address family %#q", af));
+		return (nil, 0, sprint("501 bad address family %#q", af));
 	if(afn != 1 && afn != 2)
 		return (nil, 0, sprint("522 unsupported address family %d.  try (1,2)", afn));
 	(ok, ipa) := IPaddr.parse(addr);
 	if(ok < 0)
-		return (nil, 0, sprint("500 bad ip address %#q", addr));
+		return (nil, 0, sprint("501 bad ip address %#q", addr));
 	portn: int;
 	(portn, rem) = str->toint(port, 10);
 	if(rem != nil)
-		return (nil, 0, sprint("500 bad port %#q", port));
+		return (nil, 0, sprint("501 bad port %#q", port));
 	return (ipa.text(), portn, nil);
 }
 
@@ -857,21 +957,6 @@ stat(path: string): (list of string, string)
 			l = liststr(now, d[i])::l;
 	}
 	return (lists->reverse(l), nil);
-}
-
-read(): (string, string)
-{
-	l := in.gets('\n');
-	if(l == nil)
-		fail("eof");
-	if(len l == 1 || l[len l-2] != '\r')
-		fail("missing carriage return before newline");  # or should we read up to read newline?
-	l = l[:len l-2];
-	say("> "+l);
-	(cmd, args) := str->splitstrl(l, " ");
-	if(args != nil)
-		args = args[1:];
-	return (cmd, args);
 }
 
 write(s: string)
@@ -935,6 +1020,11 @@ getlport(c: Sys->Connection): (int, string)
 cwd(): string
 {
 	return workdir->init();
+}
+
+pid(): int
+{
+	return sys->pctl(0, nil);
 }
 
 kill(pid: int)
