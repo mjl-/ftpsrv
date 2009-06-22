@@ -1,6 +1,6 @@
 # status
 
-in development.
+tested with various clients.
 
 
 # intro
@@ -29,6 +29,4 @@ mechiel lukkien, reachable at mechiel@ueber.net or mechiel@xs4all.nl.
 
 # todo
 
-- be stricter with rename & restart.  next command must use the parameters.
-- logging to /services/logs/ftp?
-- testing
+- some replies could probably have more applicable reply codes

@@ -4,7 +4,7 @@ ip/ftpsrv \- ftp server
 .SH SYNOPSIS
 .B ip/ftpsrv
 [
-.B -dr
+.B -dlr
 ] [
 .I root
 ]
@@ -21,6 +21,10 @@ Otherwise, clients can access files in
 .PP
 Options:
 .TP
+.B -l
+Log file transfers to
+.IR /services/logs/ftpsrv .
+.TP
 .B -r
 Drop priviliges after startup, becoming none.
 .TP
@@ -29,7 +33,7 @@ Print debugging output.
 .SH EXAMPLE
 Serve the files in /lib/ftp:
 .EX
-	listen -A 'net!*!ftp' ip/ftpsrv -r /lib/ftp
+	listen -A 'net!*!ftp' {ip/ftpsrv -lr /lib/ftp &}
 .EE
 .SH SOURCE
 .B /appl/cmd/ip/ftpsrv.b

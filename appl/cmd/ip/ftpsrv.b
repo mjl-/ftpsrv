@@ -1,3 +1,30 @@
+#
+# prog net() handles network dialing/announcing/listening.  it's in
+# a separate prog because the "main" prog, used for file transfer,
+# will get a new filesystem root that doesn't have /net.
+#
+# prog cmdreader() keep reading commands.  it's in a separate prog
+# so we can easily get events from either the "control connection"
+# (commands) and the data transfer prog.  that helps implement aborting
+# file transfers.
+
+# the main prog handles the commands.  data transfer commands are
+# handled in a new prog.  in the mean time a new command is read
+# (which should be an abort,quit,rein(it)).
+
+# we support some sensible extensions:  epsv/eprt, machine-parsable
+# listings.
+# we don't support the ftp authentication rfc, could be considered
+# in the future.  the "foobar" seems redundant, we have eprt/epsv.
+# language negotiation isn't worth the trouble.
+#
+# caveats:
+# - we don't use port 20 for data, clients
+# - the rfc's require support for record-structured files.  we don't.
+# - many ftp clients pass command-line-like parameters to LIST,
+#   doesn't seem to be in any rfc.
+
+
 implement Ftpsrv;
 
 include "sys.m";
@@ -32,24 +59,29 @@ Ftpsrv: module {
 Asciisizemax:	con big (256*1024);
 
 dflag: int;
+lflag: int;
 rflag: int;
 
 stop := 0;
 in: ref Iobuf;		# control input
 out: ref Sys->FD;	# control output
 datatype := "ascii";	# type, "ascii" or "image"
-retroff := big 0;	# offset of next "get"
+restoff := big 0;	# offset of next transfer
 renamefrom: string;	# source file for next rename
 user: string;		# user we are running as
 epsvonly := 0;		# only epsv accepted for data channel
+prevcmd: string;
 
 datadialaddr: string;	# client address, to dial for data commands
 dataannounce: ref Sys->Connection;	# local connection, client dials this for data commands
 datafd: ref Sys->FD;	# connection to client
 datapid := -1;		# prog doing i/o on datafd
+cmdpid := -1;
 
-cmdc: chan of (string, string, string);
-donec: chan of string;
+logfd: ref Sys->FD;
+
+cmdc: chan of (string, string, string, string);  # line, cmd, args, err
+donec: chan of string;  # final reply
 
 dialc: chan of (string, chan of (ref Sys->FD, string));
 announcec: chan of (string, chan of (ref Sys->Connection, int, string));
@@ -64,6 +96,9 @@ datacmds := array[] of {
 };
 busycmds := array[] of {
 "rein", "quit", "abor",
+};
+restcmds := array[] of {
+"stor", "retr",
 };
 
 init(nil: ref Draw->Context, argv: list of string)
@@ -81,10 +116,11 @@ init(nil: ref Draw->Context, argv: list of string)
 	base16 = load Encoding Encoding->BASE16PATH;
 
 	arg->init(argv);
-	arg->setusage(arg->progname()+" [-dr] [root]");
+	arg->setusage(arg->progname()+" [-dlr] [root]");
 	while((c := arg->opt()) != 0)
 		case c {
 		'd' =>	dflag++;
+		'l' =>	lflag++;
 		'r' =>	rflag++;
 		* =>	arg->usage();
 		}
@@ -93,6 +129,15 @@ init(nil: ref Draw->Context, argv: list of string)
 		arg->usage();
 	if(argv != nil)
 		root := hd argv;
+
+	if(lflag) {
+		p := "/services/logs/ftpsrv";
+		logfd = sys->open(p, Sys->OWRITE);
+		if(logfd != nil)
+			sys->seek(logfd, big 0, Sys->SEEKEND);
+		else
+			warn(sprint("open %q: %r", p));
+	}
 
 	# find local & remote ip
 	netdata := sys->fd2path(sys->fildes(0));
@@ -133,20 +178,23 @@ init(nil: ref Draw->Context, argv: list of string)
 	in = bufio->fopen(sys->fildes(0), Bufio->OREAD);
 	out = sys->fildes(1);
 
-	cmdc = chan of (string, string, string);
+	cmdc = chan of (string, string, string, string);
 	donec = chan of string;
-	spawn cmdreader();
+	spawn cmdreader(npidc := chan of int);
+	cmdpid = <-npidc;
 
 	write("220 ip/ftpsrv ready, welcome");
 
 	while(!stop) alt {
-	(cmd, args, rerr) := <-cmdc =>
+	(line, cmd, args, rerr) := <-cmdc =>
 		if(rerr != nil) {
 			say("read cmd: "+rerr);
 			stop = 1;
 			break;
 		}
+		say("> "+line);
 		docmd(cmd, args);
+		prevcmd = str->tolower(cmd);
 
 	s := <-donec =>
 		datafd = nil;
@@ -154,6 +202,7 @@ init(nil: ref Draw->Context, argv: list of string)
 		write(s);
 	}
 	kill(netpid);
+	kill(cmdpid);
 }
 
 net(pidc: chan of int)
@@ -170,7 +219,7 @@ net(pidc: chan of int)
 			rc <-= (c.dfd, nil);
 
 	(addr, rc) := <-announcec =>
-		say("net: announcing");
+		say("net: announcing "+addr);
 		(ok, c) := sys->announce(addr);
 		if(ok < 0) {
 			rc <-= (nil, 0, sprint("%r"));
@@ -223,24 +272,41 @@ netclear()
 	dataannounce = nil;
 }
 
-cmdreader()
+cmdreader(pidc: chan of int)
 {
+	pidc <-= pid();
+	buf := array[1024] of byte;
 	for(;;) {
-		l := in.gets('\n');
-		if(l == nil) {
-			cmdc <-= (nil, nil, "eof");
-			return;
+		o := 0;
+		for(;;) {
+			c := in.getb();
+			case c {
+			Bufio->ERROR =>
+				cmdc <-= (nil, nil, nil, sprint("read: %r"));
+			Bufio->EOF =>
+				cmdc <-= (nil, nil, nil, "eof");
+			242 or
+			243 or
+			244 or
+			245 or
+			255 =>
+				say(sprint("telnet char %d", c));
+				; # ignore, telnet escape chars.  there are more, but don't seem applicable.
+			* =>
+				if(c == '\n' && o > 0 && buf[o-1] == byte '\r') {
+					l := string buf[:o-1];
+					(cmd, args) := str->splitstrl(l, " ");
+					if(args != nil)
+						args = args[1:];
+					cmdc <-= (l, cmd, args, nil);
+					o = 0;
+				} else {
+					if(o >= len buf)
+						cmdc <-= (nil, nil, nil, "command too long");
+					buf[o++] = byte c;
+				}
+			}
 		}
-		if(len l == 1 || l[len l-2] != '\r') {
-			cmdc <-= (nil, nil, "missing carriage return before newline");  # or should we read up to read newline?
-			return;
-		}
-		l = l[:len l-2];
-		say("> "+l);
-		(cmd, args) := str->splitstrl(l, " ");
-		if(args != nil)
-			args = args[1:];
-		cmdc <-= (cmd, args, nil);
 	}
 }
 
@@ -279,12 +345,27 @@ docmd(cmd, args: string)
 {
 	cmd = str->tolower(cmd);
 
+	# data transfer active, but not a command that deals with that:
+	# wait until the transfer is done to prevent mixing up order of responses to commands.
 	if(datapid >= 0 && !iscmd(busycmds, cmd)) {
+		say("waiting for previous datacmd done");
 		waitdone();
 		netclear();
 	}
 
+	if(prevcmd == "rest"  && !iscmd(restcmds, cmd))
+		return write(sprint("400 previous command REST does not apply to %q, command dropped", str->toupper(cmd)));
+	if(prevcmd == "rnfr" && cmd != "rnto")
+		return write("400 RNTO after RNFR is required, command dropped");
+
+	# we'll need a data connection below, set it up
 	if(iscmd(datacmds, cmd)) {
+		# first some checks for sanity of the commands
+		if(prevcmd == "rest" && (cmd == "retr" || cmd == "stor") && datatype != "image")
+			return write(sprint("550 cannot REST+STOR in ascii mode"));
+		if(cmd == "retr" && isdir(args))
+			return write("550 refusing to transfer directory");
+
 		write("150 connecting...");
 
 		rc := chan of (ref Sys->FD, string);
@@ -296,17 +377,18 @@ docmd(cmd, args: string)
 		(datafd, derr) = <-rc =>
 			if(derr != nil)
 				return write("425 "+derr);
-		(ncmd, nil, err) := <-cmdc =>
+		(line, ncmd, nil, err) := <-cmdc =>
 			if(err != nil) {
 				say("read cmd error during connect: "+err);
 				stop = 1;
 				return;
 			}
+			say("> "+line);
 			if(str->tolower(ncmd) == "abor") {
 				kill(cpid);
 				return write("420 interrupted during connect");
 			}
-			return write(sprint("420 interrupted with non-abort command %#q during connect, new command dropped", ncmd));
+			return write(sprint("420 interrupted with non-abort command %q during connect, new command dropped", str->toupper(ncmd)));
 		}
 		say("connected to remote");
 	}
@@ -329,17 +411,15 @@ docmd(cmd, args: string)
 		if(sys->chdir(args) < 0)
 			write(sprint("550 CWD failed: %r"));
 		else
-			write(sprint("200 %q", cwd()));
+			write(sprint("250 %q", cwd()));
 	"cdup" =>
 		if(sys->chdir("..") < 0)
 			write(sprint("550 CDUP failed: %r"));
 		else
-			write(sprint("200 %q", cwd()));
+			write(sprint("250 %q", cwd()));
 
 	# logout
 	"rein" =>
-		retroff = big 0;
-		renamefrom = nil;
 		if(datapid >= 0)
 			waitdone();
 		write("200 ok");
@@ -445,13 +525,13 @@ docmd(cmd, args: string)
 		write("202 try me");
 	"rest" =>
 		rem: string;
-		(retroff, rem) = str->tobig(args, 10);
-		if(rem != nil) {
-			retroff = big 0;
+		(restoff, rem) = str->tobig(args, 10);
+		if(rem != nil)
 			return write(sprint("501 bad offset %#q", args));
-		} else
-			write("350 ok");
+		else
+			write("350 using offset for next command");
 	"stor" =>
+		log(sprint("stor %q", args));
 		spawn ftpstor(args, pidc := chan of int);
 		datapid = <-pidc;
 	"stou" =>
@@ -476,9 +556,7 @@ docmd(cmd, args: string)
 		else
 			write("350 ok, waiting for RNTO");
 	"rnto" =>
-		if(renamefrom == nil) {
-			write("501 no preceding RNFR");
-		} else if(args == nil) {
+		if(args == nil) {
 			write("501 empty destination path");
 		} else {
 			df := str->splitstrl(renamefrom, "/").t0;
@@ -490,6 +568,7 @@ docmd(cmd, args: string)
 				return write("501 new file name must not be empty");
 			dir := sys->nulldir;
 			dir.name = name[1:];
+			log(sprint("rename %q -> %q", renamefrom, dir.name));
 			if(sys->wstat(renamefrom, dir) < 0)
 				return write(sprint("550 rename: %r"));
 			write("200 ok");
@@ -497,21 +576,31 @@ docmd(cmd, args: string)
 		}
 	"dele" or
 	"rmd" =>
+		log(sprint("remove %q", args));
 		if(sys->remove(args) < 0)
 			write(sprint("550 remove failed: %r"));
 		else
 			write("250 ok");
 	"mkd" =>
-		if(sys->create(args, Sys->OREAD, 8r777|Sys->DMDIR) != nil)
+		log(sprint("mkdir %q", args));
+		if(sys->create(args, Sys->OREAD, 8r777|Sys->DMDIR) != nil) {
 			write(sprint("550 mkdir failed: %r"));
-		else
-			write("257 ok");
+		} else {
+			npath := args;
+			if(!str->prefix("/", args))
+				npath = cwd()+"/"+args;
+			write(sprint("257 \"%s\" created", npath));
+		}
 	"pwd" =>
-		write(sprint("257 %s", cwd()));
+		write(sprint("257 \"%s\"", cwd()));
 	"abor" =>
-		if(datapid >= 0)
+		if(datapid >= 0) {
+			say(sprint("killing datapid %d", datapid));
 			kill(datapid);
-		datapid = -1;
+			datapid = -1;
+			datafd = nil;
+			write("426 aborted");
+		}
 		write("200 ok");
 
 	# informational
@@ -536,7 +625,7 @@ docmd(cmd, args: string)
 
 	# misc
 	"site" =>
-		write("502 SITE not implemented");
+		write(sprint("504 SITE not implemented for %#q", args));
 	"noop" =>
 		write("200 ok");
 
@@ -594,7 +683,7 @@ docmd(cmd, args: string)
 
 	# all else unsupported
 	* =>
-		write(sprint("502 %s not implemented", str->toupper(cmd)));
+		write(sprint("502 %q not implemented", str->toupper(cmd)));
 	}
 }
 
@@ -605,12 +694,23 @@ done(s: string)
 
 ftpstor(args: string, pidc: chan of int)
 {
+	log(sprint("store %q", args));
+	fd := sys->create(args, Sys->OWRITE|Sys->OEXCL, 8r666);
+	if(fd == nil)
+		fd = sys->open(args, Sys->OWRITE);
+	if(fd == nil) {
+		pidc <-= pid();
+		return done(sprint("451 create %q: %r", args));
+	}
+	if(prevcmd == "rest") {
+		if(sys->seek(fd, restoff, Sys->SEEKSTART) != restoff) {
+			pidc <-= pid();
+			return done(sprint("451 seek to %bd: %r", restoff));
+		}
+	}
 	pidc <-= pid();
 
-	fd := sys->create(args, Sys->OWRITE|Sys->OTRUNC, 8r666);
-	if(fd == nil)
-		return done(sprint("451 create %q: %r", args));
-	buf := array[Sys->ATOMICIO] of byte;
+	buf := array[32*1024] of byte;
 	for(;;) {
 		n := sys->read(datafd, buf, len buf);
 		if(n < 0)
@@ -623,16 +723,17 @@ ftpstor(args: string, pidc: chan of int)
 	return done("226 done");
 }
 
-ftpstou(args: string, pidc: chan of int)
+ftpstou(nil: string, pidc: chan of int)
 {
 	pidc <-= pid();
 
 	fbuf := random->randombuf(Random->NotQuiteRandom, 10);
 	f := base16->enc(fbuf);
-	fd := sys->create(args, Sys->OWRITE|Sys->OEXCL, 8r666);
+	log(sprint("storeunique %q", f));
+	fd := sys->create(f, Sys->OWRITE|Sys->OEXCL, 8r666);
 	if(fd == nil)
 		return done(sprint("451 create %q: %r", f));
-	buf := array[Sys->ATOMICIO] of byte;
+	buf := array[32*1024] of byte;
 	for(;;) {
 		n := sys->read(datafd, buf, len buf);
 		if(n < 0)
@@ -649,13 +750,13 @@ ftpappe(args: string, pidc: chan of int)
 {
 	pidc <-= pid();
 
+	log(sprint("append %q", args));
 	fd := sys->create(args, Sys->OWRITE|Sys->OEXCL, 8r666);
 	if(fd == nil)
 		fd = sys->open(args, Sys->OWRITE);
 	if(fd == nil)
 		return done(sprint("451 open %q: %r", args));
-	sys->seek(fd, big 0, Sys->SEEKEND);
-	buf := array[Sys->ATOMICIO] of byte;
+	buf := array[32*1024] of byte;
 	for(;;) {
 		n := sys->read(datafd, buf, len buf);
 		if(n < 0)
@@ -670,16 +771,23 @@ ftpappe(args: string, pidc: chan of int)
 
 ftpretr(args: string, ascii: int, pidc: chan of int)
 {
+	log(sprint("retrieve %q", args));
+	fd := sys->open(args, Sys->OREAD);
+	if(fd == nil) {
+		pidc <-= pid();
+		return done(sprint("451 open %q: %r", args));
+	}
+	if(prevcmd == "rest") {
+		if(sys->seek(fd, restoff, Sys->SEEKSTART) != restoff) {
+			pidc <-= pid();
+			return done(sprint("451 seek to %bd: %r", restoff));
+		}
+	}
 	pidc <-= pid();
 
-	fd := sys->open(args, Sys->OREAD);
-	if(fd == nil)
-		return done(sprint("451 open %q: %r", args));
-	sys->seek(fd, retroff, Sys->SEEKSTART);
-	retroff = big 0;
-	buf := array[Sys->ATOMICIO] of byte;
+	buf := array[32*1024] of byte;
 	if(ascii)
-		b := bufio->fopen(sys->fildes(1), Bufio->OWRITE);
+		b := bufio->fopen(datafd, Bufio->OWRITE);
 	for(;;) {
 		n := sys->read(fd, buf, len buf);
 		if(n < 0)
@@ -713,6 +821,14 @@ ftplist(args: string, pidc: chan of int)
 {
 	pidc <-= pid();
 
+	# many clients don't mind sending command-line options to LIST as if it were unix ls(1), ignore some common ones
+	case str->tolower(args) {
+	"-a" or
+	"-l" or
+	"-la" or
+	"-al" =>
+		args = nil;
+	}
 	if(args == nil)
 		args = cwd();
 	if(args == nil)
@@ -833,7 +949,7 @@ asciisize(p: string, length: big): (big, string)
 	fd := sys->open(p, Sys->OREAD);
 	if(fd == nil)
 		return (big -1, sprint("open %q: %r", p));
-	buf := array[Sys->ATOMICIO] of byte;
+	buf := array[32*1024] of byte;
 	size := big 0;
 	for(;;) {
 		n := sys->read(fd, buf, len buf);
@@ -884,7 +1000,7 @@ lstpermstr(dir: Sys->Dir): string
 
 parsehostport(s: string, cmd: string): (string, int, string)
 {
-	if(cmd == "pasv")
+	if(cmd == "port")
 		return parsehostport0(s);
 	return parsehostport1(s);
 }
@@ -1017,6 +1133,18 @@ getlport(c: Sys->Connection): (int, string)
 	return (port, nil);
 }
 
+log(s: string)
+{
+	if(logfd != nil)
+		sys->fprint(logfd, "%s\n", s);
+}
+
+isdir(f: string): int
+{
+	(ok, d) := sys->stat(f);
+	return ok < 0 || (d.mode & Sys->DMDIR);
+}
+
 cwd(): string
 {
 	return workdir->init();
@@ -1050,6 +1178,7 @@ fail(s: string)
 {
 	kill(netpid);
 	kill(datapid);
+	kill(cmdpid);
 	warn(s);
 	raise "fail:"+s;
 }
