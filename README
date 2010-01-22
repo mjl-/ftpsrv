@@ -10,9 +10,11 @@ ip/ftpsrv is a simple anonymous ftp server.
 
 # install
 
-first, ensure a "mkconfig" file is present.  a bind/symlink to the
-mkconfig of your inferno install should do.  now "mk install" to
-compile and install the files.
+make sure $ROOT is set, now run "mk install" to compile and install
+the files.
+
+when building from within inferno, insert SYSHOST=Inferno and ROOT=
+in the mk invocations to override the values in the mkconfig.
 
 
 # latest version
